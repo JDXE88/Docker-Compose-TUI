@@ -1,0 +1,468 @@
+#!/usr/bin/env bash
+set -u
+
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1 || {
+    echo "Missing command: $1"
+    exit 1
+  }
+}
+
+term_lines() {
+  tput lines 2>/dev/null || echo 24
+}
+
+term_cols() {
+  tput cols 2>/dev/null || echo 80
+}
+
+box_h() {
+  local h
+  h=$(term_lines)
+  if (( h < 20 )); then
+    echo 18
+  else
+    echo $((h - 4))
+  fi
+}
+
+box_w() {
+  local w
+  w=$(term_cols)
+  if (( w < 80 )); then
+    echo 78
+  elif (( w > 120 )); then
+    echo 110
+  else
+    echo $((w - 4))
+  fi
+}
+
+menu_h() {
+  local h
+  h=$(term_lines)
+  if (( h < 20 )); then
+    echo 10
+  elif (( h > 35 )); then
+    echo 18
+  else
+    echo $((h - 10))
+  fi
+}
+
+msg() {
+  whiptail --title "${1:-Info}" --msgbox "${2:-}" 12 "$(box_w)"
+}
+
+yesno() {
+  whiptail --title "${1:-Confirm}" --yesno "${2:-}" 14 "$(box_w)"
+}
+
+trim_desc() {
+  local s="$1"
+  local max="${2:-38}"
+  if (( ${#s} > max )); then
+    printf '%s…' "${s:0:max-1}"
+  else
+    printf '%s' "$s"
+  fi
+}
+
+get_alldockerconfigs() {
+  local containers c project working_dir config_files service image
+
+  containers=$(sudo docker ps --format '{{.Names}}')
+  if [[ -z "$containers" ]]; then
+    echo "No running containers found."
+    return 0
+  fi
+
+  while IFS= read -r c; do
+    project=$(sudo docker inspect -f '{{ index .Config.Labels "com.docker.compose.project" }}' "$c" 2>/dev/null || true)
+    service=$(sudo docker inspect -f '{{ index .Config.Labels "com.docker.compose.service" }}' "$c" 2>/dev/null || true)
+    working_dir=$(sudo docker inspect -f '{{ index .Config.Labels "com.docker.compose.project.working_dir" }}' "$c" 2>/dev/null || true)
+    config_files=$(sudo docker inspect -f '{{ index .Config.Labels "com.docker.compose.project.config_files" }}' "$c" 2>/dev/null || true)
+    image=$(sudo docker inspect -f '{{.Config.Image}}' "$c" 2>/dev/null || true)
+
+    echo "=== $c ==="
+    echo "project=${project:-<none>}"
+    echo "service=${service:-<none>}"
+    echo "working_dir=${working_dir:-<none>}"
+    echo "config_files=${config_files:-<none>}"
+    echo "image=${image:-<none>}"
+    echo
+  done <<< "$containers"
+}
+
+docker_compose_file_for_container() {
+  local c="$1"
+  sudo docker inspect -f '{{ index .Config.Labels "com.docker.compose.project.config_files" }}' "$c" 2>/dev/null || true
+}
+
+docker_compose_service_for_container() {
+  local c="$1"
+  sudo docker inspect -f '{{ index .Config.Labels "com.docker.compose.service" }}' "$c" 2>/dev/null || true
+}
+
+docker_compose_project_for_container() {
+  local c="$1"
+  sudo docker inspect -f '{{ index .Config.Labels "com.docker.compose.project" }}' "$c" 2>/dev/null || true
+}
+
+docker_container_current_image() {
+  local c="$1"
+  sudo docker inspect -f '{{.Config.Image}}' "$c" 2>/dev/null || true
+}
+
+image_repo_from_ref() {
+  local ref="$1"
+  if [[ "$ref" == *@sha256:* ]]; then
+    printf '%s
+' "${ref%@sha256:*}"
+  elif [[ "$ref" == *:* ]]; then
+    printf '%s
+' "${ref%:*}"
+  else
+    printf '%s
+' "$ref"
+  fi
+}
+
+image_tag_from_ref() {
+  local ref="$1"
+  if [[ "$ref" == *@sha256:* ]]; then
+    printf '%s
+' ""
+  elif [[ "$ref" == *:* ]]; then
+    printf '%s
+' "${ref##*:}"
+  else
+    printf '%s
+' "latest"
+  fi
+}
+
+dockerhub_api_repo() {
+  local repo="$1"
+  if [[ "$repo" == */* ]]; then
+    printf '%s
+' "$repo"
+  else
+    printf 'library/%s
+' "$repo"
+  fi
+}
+
+dockerhub_version_tags() {
+  local repo="$1"
+  local api_repo url
+
+  [[ -z "${repo:-}" ]] && {
+    echo "Usage: dockerhub_version_tags repo" >&2
+    return 1
+  }
+
+  api_repo=$(dockerhub_api_repo "$repo")
+  url="https://hub.docker.com/v2/repositories/${api_repo}/tags?page_size=1000"
+
+  curl -fsSL "$url" \
+    | jq -r '.results[].name' \
+    | grep -E '^[0-9]+(.[0-9]+){1,3}$' \
+    | sort -V
+}
+
+dockerhub_prev_version_tag() {
+  local repo="$1"
+  local current="$2"
+
+  [[ -z "${repo:-}" || -z "${current:-}" ]] && {
+    echo "Usage: dockerhub_prev_version_tag repo current_version" >&2
+    return 1
+  }
+
+  dockerhub_version_tags "$repo" | awk -v cur="$current" '
+    $0 == cur { print prev; found=1; exit }
+    { prev=$0 }
+    END { if (!found) exit 1 }
+  '
+}
+
+dockerhub_select_version_tag() {
+  local repo="$1"
+  local current="${2:-}"
+  local selected tag marker
+  local -a items=()
+
+  [[ -z "${repo:-}" ]] && {
+    echo "Usage: dockerhub_select_version_tag repo [current_tag]" >&2
+    return 1
+  }
+
+  while IFS= read -r tag; do
+    marker=""
+    [[ -n "$current" && "$tag" == "$current" ]] && marker="current"
+    items+=("$tag" "$marker")
+  done < <(dockerhub_version_tags "$repo" | sort -Vr)
+
+  [[ ${#items[@]} -eq 0 ]] && {
+    msg "No tags" "No version-like tags found for $repo"
+    return 1
+  }
+
+  selected=$(whiptail \
+    --title "Select rollback tag" \
+    --menu "Choose a version tag for $repo" \
+    "$(box_h)" "$(box_w)" "$(menu_h)" \
+    "${items[@]}" \
+    3>&1 1>&2 2>&3) || return 1
+
+  printf '%s
+' "$selected"
+}
+
+docker_compose_backup_and_revert() {
+  local compose_file="$1"
+  local service="$2"
+  local target_image="$3"
+  local backup_file tmp_file
+
+  [[ -z "${compose_file:-}" || -z "${service:-}" || -z "${target_image:-}" ]] && {
+    echo "Usage: docker_compose_backup_and_revert /path/to/docker-compose.yml service image:tag" >&2
+    return 1
+  }
+
+  [[ ! -f "$compose_file" ]] && {
+    echo "Compose file not found: $compose_file" >&2
+    return 1
+  }
+
+  backup_file="${compose_file}.bak.$(date +%F-%H%M%S)"
+  tmp_file="$(mktemp)"
+
+  sudo cp "$compose_file" "$backup_file" || return 1
+
+  awk -v svc="$service" -v newimg="$target_image" '
+    BEGIN { in_services=0; in_svc=0 }
+    $1=="services:" { in_services=1; print; next }
+    in_services && $1==svc ":" { in_svc=1; print; next }
+    in_svc && $1=="image:" { $0="    image: " newimg; found=1; print; next }
+    in_svc && $1 ~ /^[A-Za-z0-9_.-]+:$/ { in_svc=0 }
+    { print }
+    END { if (!found) exit 7 }
+  ' "$compose_file" | sudo tee "$tmp_file" >/dev/null || {
+    rm -f "$tmp_file"
+    echo "Failed to update compose file."
+    return 1
+  }
+
+  sudo cp "$tmp_file" "$compose_file" || {
+    rm -f "$tmp_file"
+    return 1
+  }
+  rm -f "$tmp_file"
+
+  if ! sudo docker compose -f "$compose_file" config >/dev/null 2>&1; then
+    sudo cp "$backup_file" "$compose_file"
+    echo "Compose validation failed. Restored backup: $backup_file" >&2
+    return 1
+  fi
+
+  sudo docker compose -f "$compose_file" pull "$service" || true
+  sudo docker compose -f "$compose_file" up -d "$service"
+}
+
+docker_compose_pick_remote_revert_tag() {
+  local current_image="$1"
+  local repo current_tag selected
+
+  [[ -z "${current_image:-}" ]] && return 1
+
+  repo=$(image_repo_from_ref "$current_image")
+  current_tag=$(image_tag_from_ref "$current_image")
+
+  if [[ "$current_tag" == "latest" || "$current_tag" == "stable" || -z "$current_tag" ]]; then
+    dockerhub_select_version_tag "$repo" "$current_tag"
+  else
+    selected=$(dockerhub_prev_version_tag "$repo" "$current_tag" 2>/dev/null || true)
+    if [[ -n "$selected" ]]; then
+      printf '%s
+' "$selected"
+    else
+      dockerhub_select_version_tag "$repo" "$current_tag"
+    fi
+  fi
+}
+
+docker_compose_set_latest() {
+  local compose_file="$1"
+  local service="$2"
+  local current_image="$3"
+  local repo target_image
+
+  [[ -z "${compose_file:-}" || -z "${service:-}" || -z "${current_image:-}" ]] && return 1
+
+  repo=$(image_repo_from_ref "$current_image")
+  target_image="${repo}:latest"
+
+  docker_compose_backup_and_revert "$compose_file" "$service" "$target_image"
+}
+
+docker_compose_tui() {
+  need_cmd docker
+  need_cmd whiptail
+  need_cmd jq
+  need_cmd curl
+
+  local -a containers=() options=()
+  local c compose_file service project image desc choice action repo current_tag selected_tag target_image tagfile
+
+  mapfile -t containers < <(sudo docker ps --format '{{.Names}}')
+  if [[ ${#containers[@]} -eq 0 ]]; then
+    msg "Docker Compose TUI" "No running containers found."
+    return 0
+  fi
+
+  while true; do
+    mapfile -t containers < <(sudo docker ps --format '{{.Names}}')
+    options=()
+
+    for c in "${containers[@]}"; do
+      service=$(docker_compose_service_for_container "$c")
+      compose_file=$(docker_compose_file_for_container "$c")
+      desc="$(trim_desc "${service:-unknown} | $(basename "${compose_file:-n/a}")" 38)"
+      options+=("$c" "$desc")
+    done
+
+    choice=$(whiptail \
+      --title "Docker Compose TUI" \
+      --menu "Choose a running container" \
+      "$(box_h)" "$(box_w)" "$(menu_h)" \
+      "${options[@]}" \
+      3>&1 1>&2 2>&3) || return 0
+
+    compose_file=$(docker_compose_file_for_container "$choice")
+    service=$(docker_compose_service_for_container "$choice")
+    project=$(docker_compose_project_for_container "$choice")
+    image=$(docker_container_current_image "$choice")
+
+    if [[ -z "$compose_file" || ! -f "$compose_file" ]]; then
+      msg "No compose file" "No compose file found for $choice"
+      continue
+    fi
+
+    if [[ -z "$service" ]]; then
+      msg "No compose service" "No compose service label found for $choice"
+      continue
+    fi
+
+    while true; do
+      action=$(whiptail \
+        --title "Docker Compose TUI" \
+        --menu "Container: $choice
+Project: ${project:-unknown}
+Service: $service
+Image: $image
+Compose: $compose_file" \
+        "$(box_h)" "$(box_w)" "$(menu_h)" \
+        "show_compose" "Show compose path" \
+        "show_image"   "Show image reference" \
+        "show_tags"    "Show remote version tags" \
+        "revert_pick"  "Pick rollback tag" \
+        "revert_prev"  "Auto previous / picker" \
+        "set_latest"   "Set image back to latest" \
+        "back"         "Back to container list" \
+        3>&1 1>&2 2>&3) || break
+
+      case "$action" in
+        show_compose)
+          msg "Compose file" "$compose_file"
+          ;;
+        show_image)
+          msg "Current image" "$image"
+          ;;
+        show_tags)
+          repo=$(image_repo_from_ref "$image")
+          tagfile="$(mktemp)"
+
+          if dockerhub_version_tags "$repo" > "$tagfile" 2>/dev/null && [[ -s "$tagfile" ]]; then
+            whiptail \
+              --title "Remote version tags" \
+              --textbox "$tagfile" "$(box_h)" "$(box_w)"
+          else
+            printf 'No version-like tags found for %s
+' "$repo" > "$tagfile"
+            whiptail \
+              --title "Remote version tags" \
+              --textbox "$tagfile" "$(box_h)" "$(box_w)"
+          fi
+
+          rm -f "$tagfile"
+          ;;
+        revert_pick)
+          repo=$(image_repo_from_ref "$image")
+          current_tag=$(image_tag_from_ref "$image")
+          selected_tag=$(dockerhub_select_version_tag "$repo" "$current_tag") || continue
+          target_image="${repo}:${selected_tag}"
+
+          if yesno "Confirm revert" "Revert $choice
+
+From: $image
+To:   $target_image
+
+This will back up the compose file and recreate only the $service service."; then
+            if docker_compose_backup_and_revert "$compose_file" "$service" "$target_image"; then
+              image="$target_image"
+              msg "Done" "Reverted $choice to $target_image"
+            else
+              msg "Error" "Revert failed. Check terminal output for details."
+            fi
+          fi
+          ;;
+        revert_prev)
+          repo=$(image_repo_from_ref "$image")
+          selected_tag=$(docker_compose_pick_remote_revert_tag "$image") || continue
+          target_image="${repo}:${selected_tag}"
+
+          if yesno "Confirm revert" "Revert $choice
+
+From: $image
+To:   $target_image
+
+This will back up the compose file and recreate only the $service service."; then
+            if docker_compose_backup_and_revert "$compose_file" "$service" "$target_image"; then
+              image="$target_image"
+              msg "Done" "Reverted $choice to $target_image"
+            else
+              msg "Error" "Revert failed. Check terminal output for details."
+            fi
+          fi
+          ;;
+        set_latest)
+          repo=$(image_repo_from_ref "$image")
+          target_image="${repo}:latest"
+
+          if yesno "Confirm latest" "Set $choice back to latest
+
+From: $image
+To:   $target_image
+
+This will back up the compose file and recreate only the $service service."; then
+            if docker_compose_set_latest "$compose_file" "$service" "$image"; then
+              image="$target_image"
+              msg "Done" "Set $choice back to $target_image"
+            else
+              msg "Error" "Setting latest failed. Check terminal output for details."
+            fi
+          fi
+          ;;
+        back)
+          break
+          ;;
+      esac
+    done
+  done
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  docker_compose_tui
+fi
