@@ -2,6 +2,8 @@
 
 A terminal-based Docker Compose helper for SSH sessions. It provides a `whiptail`-driven menu for inspecting running Compose-managed containers, locating their Compose files, viewing remote version tags from Docker Hub, reverting to an older version tag, and switching a service back to `:latest` when needed.
 
+![Docker Compose TUI screenshot](screenshot.png)
+
 ## What it does
 
 This script is designed for Docker hosts where services are managed with Docker Compose and containers expose Compose metadata such as `com.docker.compose.project`, `com.docker.compose.service`, and `com.docker.compose.project.config_files` labels.The TUI uses those labels to discover which Compose file controls each running container and then performs targeted edits against the correct service entry instead of assuming the container name and service name are always identical.
