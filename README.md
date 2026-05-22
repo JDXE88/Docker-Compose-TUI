@@ -112,9 +112,13 @@ These labels are used to identify the Compose project, service name, and the act
 
 ### 2. Compose-aware service targeting
 
+![Docker Compose TUI screenshot](screenshot2.jpg)
+
 When an action is selected, the script edits the matching service inside the discovered Compose file rather than guessing based on the container name. This matters because Compose container names and service names are related but not always a safe one-to-one assumption in custom setups.
 
 ### 3. Remote tag lookup
+
+![Docker Compose TUI screenshot](screenshot3.jpg)
 
 The script calls the Docker Hub tag API and parses tag names using `jq`.It filters for version-like tags with a regex and sorts them with version sorting so the menu can present sensible rollback candidates.
 
